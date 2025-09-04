@@ -1,0 +1,6 @@
+input/*
+output/*
+output_quilts/*
+.venv/*
+venv/*
+__pycache__/*
