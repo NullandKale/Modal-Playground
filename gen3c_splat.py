@@ -1,4 +1,4 @@
-# gen3c.py
+# gen3c_splat.py
 import os
 import sys
 import time
@@ -25,19 +25,6 @@ FUNC_TIMEOUT = 4 * 60 * 60
 
 # ---------------- Fixed single-image script expectations ----------------
 NUM_FRAMES = 121
-DAD_MODEL_ID = "xingyang1/Distill-Any-Depth-Large-hf"
-FIXED_DEPTH_MIN = 0.50
-FIXED_DEPTH_MAX = 3.00
-RESCALE_PERCENTILES_LO = 0.05
-RESCALE_PERCENTILES_HI = 0.95
-CLAMP_FINAL_DEPTH = True
-INTRINSICS_MODE = "fov"  # "fov" or "explicit"
-FOV_DEG = 45.0
-# For "explicit" intrinsics mode, set these and flip INTRINSICS_MODE = "explicit"
-FX = None
-FY = None
-CX = None
-CY = None
 # -----------------------------------------------------------------------
 
 stub = modal.App(APP_NAME)
@@ -173,10 +160,6 @@ def _even(n: int) -> int:
     return n if n % 2 == 0 else n - 1
 
 def _ffmpeg_scale_only(in_mp4: str, out_mp4: str, target_w: int, target_h: int, dar_num: int, dar_den: int) -> None:
-    """
-    One high-quality encode pass to scale & set DAR.
-    H.264 CRF 12 + preset slow + yuv420p for compatibility.
-    """
     tmp = out_mp4 + ".tmp.mp4"
     cmd = [
         "ffmpeg", "-y",
@@ -226,11 +209,12 @@ def _read_from_outputs_volume(key: str, *, retries: int = 6, delay: float = 0.8)
     raise FileNotFoundError(f"Could not read '{key}' from outputs volume after {retries} attempts. Last error: {last_err}")
 
 def _git_pull_repo() -> None:
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        _log(f"Cloning repo into {REPO_DIR} (first run)...")
-        _run(["git", "clone", "--recurse-submodules", "https://github.com/nullandkale/GEN3C", REPO_DIR])
-        return
-    _run(["git", "-C", REPO_DIR, "pull", "--rebase", "--autostash"])
+    url = "https://github.com/nv-tlabs/GEN3C"
+    if os.path.isdir(REPO_DIR):
+        _log(f"Removing {REPO_DIR} ...")
+        shutil.rmtree(REPO_DIR, ignore_errors=True)
+    _log(f"Cloning fresh repo into {REPO_DIR} from {url} ...")
+    _run(["git", "clone", "--recurse-submodules", url, REPO_DIR])
     _run(["git", "-C", REPO_DIR, "submodule", "update", "--init", "--recursive"])
     try:
         rev = _run(["git", "-C", REPO_DIR, "rev-parse", "--short", "HEAD"]).strip().splitlines()[-1]
@@ -238,7 +222,7 @@ def _git_pull_repo() -> None:
     except Exception:
         pass
 
-# ---------- Render one trajectory (121 frames, fixed-depth mode) ----------
+# ---------- Render one trajectory (121 frames) ----------
 @stub.function(
     image=image,
     gpu=DEFAULT_GPU,
@@ -249,34 +233,22 @@ def _git_pull_repo() -> None:
 def gen3c_render_single_move(
     input_image_bytes: bytes,
     base_name: str,
-    trajectory: str,                 # "left" or "right"
+    trajectory: str,
     guidance: float,
     movement_distance: float,
-    use_offload: bool
+    use_offload: bool,
+    camera_rotation: str
 ) -> Dict[str, str]:
-    _log(f"Worker started for {base_name} [trajectory={trajectory}]")
-
+    _log(f"Worker started for {base_name} [trajectory={trajectory}, camera_rotation={camera_rotation}]")
     _git_pull_repo()
     _ensure_checkpoints("HUGGINGFACE_TOKEN")
-
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
-
     stem = f"{base_name}_{trajectory}"
     raw_name = f"{stem}_rail"
-    conditioning_stem = f"{stem}_input"
-    depth_dir = os.path.join(OUTPUTS_DIR, "depth", stem)
-    mask_dir = os.path.join(OUTPUTS_DIR, "mask", stem)
-    buffers_zip = os.path.join(OUTPUTS_DIR, f"{stem}_buffers.zip")
     final_mp4 = os.path.join(OUTPUTS_DIR, f"{stem}.mp4")
-    conditioning_mp4 = os.path.join(OUTPUTS_DIR, f"{conditioning_stem}.mp4")
-
-    os.makedirs(depth_dir, exist_ok=True)
-    os.makedirs(mask_dir, exist_ok=True)
-
     tmp_img = _write_temp_png(input_image_bytes)
     try:
         env = {"PYTHONPATH": REPO_DIR}
-
         cmd = [
             "python", f"{REPO_DIR}/cosmos_predict1/diffusion/inference/gen3c_single_image.py",
             "--checkpoint_dir", WEIGHTS_DIR,
@@ -286,31 +258,10 @@ def gen3c_render_single_move(
             "--guidance", str(guidance),
             "--foreground_masking",
             "--trajectory", trajectory,
-            "--camera_rotation", "no_rotation",
+            "--camera_rotation", camera_rotation,
             "--movement_distance", str(movement_distance),
             "--num_video_frames", str(NUM_FRAMES),
-            "--save_conditioning_video",
-            "--conditioning_video_name", conditioning_stem,
-            "--save_depth_dir", depth_dir,
-            "--save_mask_dir", mask_dir,
-            "--disable_guardrail",
-            "--disable_prompt_upsampler",
-            "--disable_prompt_encoder",
-            "--dad_model_id", DAD_MODEL_ID,
-            "--fixed_depth_min", str(FIXED_DEPTH_MIN),
-            "--fixed_depth_max", str(FIXED_DEPTH_MAX),
-            "--rescale_percentiles_lo", str(RESCALE_PERCENTILES_LO),
-            "--rescale_percentiles_hi", str(RESCALE_PERCENTILES_HI),
-            "--intrinsics_mode", INTRINSICS_MODE,
         ]
-        if CLAMP_FINAL_DEPTH:
-            cmd += ["--clamp_final_depth"]
-        if INTRINSICS_MODE == "fov":
-            cmd += ["--fov_deg", str(FOV_DEG)]
-        else:
-            if None in (FX, FY, CX, CY):
-                raise ValueError("INTRINSICS_MODE is 'explicit' but FX/FY/CX/CY are not all set.")
-            cmd += ["--fx", str(FX), "--fy", str(FY), "--cx", str(CX), "--cy", str(CY)]
         if use_offload:
             cmd += [
                 "--offload_diffusion_transformer",
@@ -321,11 +272,9 @@ def gen3c_render_single_move(
             ]
         _log(f"BEGIN render ({trajectory})")
         _run(cmd, cwd=REPO_DIR, extra_env=env)
-
         raw_mp4 = os.path.join(OUTPUTS_DIR, raw_name + ".mp4")
         if not os.path.exists(raw_mp4):
-            raise FileNotFoundError(f"Expected rail output missing: {raw_mp4}")
-
+            raise FileNotFoundError(f"Expected output missing: {raw_mp4}")
         import numpy as _np, cv2 as _cv2
         arr = _np.frombuffer(input_image_bytes, dtype=_np.uint8)
         img = _cv2.imdecode(arr, _cv2.IMREAD_UNCHANGED)
@@ -335,7 +284,6 @@ def gen3c_render_single_move(
         rw, rh = _ffprobe_resolution(raw_mp4)
         target_h = rh if rh % 2 == 0 else rh - 1
         target_w = _even(round(target_h * (iw / ih)))
-
         if target_w != rw or target_h != rh:
             _ffmpeg_scale_only(raw_mp4, final_mp4, target_w, target_h, iw, ih)
             try:
@@ -348,25 +296,10 @@ def gen3c_render_single_move(
                 os.remove(raw_mp4)
             except OSError:
                 pass
-
-        def _add_tree(zf: zipfile.ZipFile, root_dir: str, prefix_in_zip: str):
-            if os.path.isdir(root_dir):
-                for p in sorted(glob.glob(os.path.join(root_dir, "**", "*"), recursive=True)):
-                    if os.path.isfile(p):
-                        arc = os.path.join(prefix_in_zip, os.path.relpath(p, root_dir))
-                        zf.write(p, arcname=arc)
-
-        with zipfile.ZipFile(buffers_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            _add_tree(zf, depth_dir, f"depth/{stem}")
-            _add_tree(zf, mask_dir, f"mask/{stem}")
-
         outputs_vol.commit()
-
         _log(f"Done: {final_mp4}")
         return {
             "final": os.path.basename(final_mp4),
-            "conditioning": os.path.basename(conditioning_mp4) if os.path.exists(conditioning_mp4) else "",
-            "buffers": os.path.basename(buffers_zip) if os.path.exists(buffers_zip) else "",
         }
     finally:
         try:
@@ -374,38 +307,35 @@ def gen3c_render_single_move(
         except OSError:
             pass
 
-# ---------- Merge left+right into one centered clip ----------
+# ---------- Merge three clips into one sequence ----------
 @stub.function(
     image=image,
     gpu=None,
     timeout=30 * 60,
     volumes={"/vol/outputs": outputs_vol},
 )
-def merge_left_right(base_name: str) -> str:
+def merge_three_movements(base_name: str) -> str:
     """
-    Single-pass high-quality merge:
-      [left] --reverse--> [v0]
-      [v0] + [right] --concat--> merged
+    Concatenate: left + right + zoom-out
     """
     left = os.path.join(OUTPUTS_DIR, f"{base_name}_left.mp4")
     right = os.path.join(OUTPUTS_DIR, f"{base_name}_right.mp4")
+    zoom = os.path.join(OUTPUTS_DIR, f"{base_name}_zoom_out.mp4")
     merged = os.path.join(OUTPUTS_DIR, f"{base_name}.mp4")
-
     def exists(p: str) -> bool:
         ok = os.path.exists(p) and os.path.getsize(p) > 0
         _log(f"check {p}: {'OK' if ok else 'MISSING'}")
         return ok
-
-    if not (exists(left) and exists(right)):
-        _log("Left/right clips not present; skipping merge.")
+    if not (exists(left) and exists(right) and exists(zoom)):
+        _log("One or more movement clips not present; skipping merge.")
         return ""
-
     try:
         _run([
             "ffmpeg", "-y",
             "-i", left,
             "-i", right,
-            "-filter_complex", "[0:v]reverse[v0];[v0][1:v]concat=n=2:v=1:a=0[v]",
+            "-i", zoom,
+            "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
             "-map", "[v]",
             "-c:v", "libx264", "-preset", "slow", "-crf", "12",
             "-pix_fmt", "yuv420p",
@@ -423,7 +353,7 @@ def merge_left_right(base_name: str) -> str:
             pass
         return ""
 
-# ---------- Orchestrate one image end-to-end (left+right, merge) ----------
+# ---------- Orchestrate one image end-to-end (left, right, zoom-out, merge) ----------
 @stub.function(
     image=image,
     gpu=None,
@@ -437,37 +367,43 @@ def process_one_image(
     movement_distance: float,
     use_offload: bool,
 ) -> Dict[str, str]:
-    left_call = gen3c_render_single_move.spawn(
+    rot_left_call = gen3c_render_single_move.spawn(
         input_image_bytes=input_image_bytes,
         base_name=base_name,
         trajectory="left",
         guidance=guidance,
         movement_distance=movement_distance,
         use_offload=use_offload,
+        camera_rotation="center_facing",
     )
-    right_call = gen3c_render_single_move.spawn(
+    rot_right_call = gen3c_render_single_move.spawn(
         input_image_bytes=input_image_bytes,
         base_name=base_name,
         trajectory="right",
         guidance=guidance,
         movement_distance=movement_distance,
         use_offload=use_offload,
+        camera_rotation="center_facing",
     )
-
-    left_manifest = left_call.get()
-    right_manifest = right_call.get()
-
-    merged_basename = merge_left_right.remote(base_name)
-
+    zoom_out_call = gen3c_render_single_move.spawn(
+        input_image_bytes=input_image_bytes,
+        base_name=base_name,
+        trajectory="zoom_out",
+        guidance=guidance,
+        movement_distance=movement_distance,
+        use_offload=use_offload,
+        camera_rotation="center_facing",
+    )
+    rot_left_manifest = rot_left_call.get()
+    rot_right_manifest = rot_right_call.get()
+    zoom_out_manifest = zoom_out_call.get()
+    merged_basename = merge_three_movements.remote(base_name)
     return {
         "base": base_name,
-        "left_final": left_manifest.get("final", ""),
-        "right_final": right_manifest.get("final", ""),
+        "rotate_left_final": rot_left_manifest.get("final", ""),
+        "rotate_right_final": rot_right_manifest.get("final", ""),
+        "zoom_out_final": zoom_out_manifest.get("final", ""),
         "merged_final": merged_basename or "",
-        "left_conditioning": left_manifest.get("conditioning", ""),
-        "right_conditioning": right_manifest.get("conditioning", ""),
-        "left_buffers": left_manifest.get("buffers", ""),
-        "right_buffers": right_manifest.get("buffers", ""),
     }
 
 @stub.local_entrypoint()
@@ -477,7 +413,7 @@ def main(
     guidance: float = 1.0,
     movement_distance: float = 0.25,
     offload: int = 0,
-    max_concurrent_images: int = 6,
+    max_concurrent_images: int = 1,
 ) -> None:
     if not input_image_path:
         input_image_path = "input"
@@ -485,12 +421,11 @@ def main(
     if not paths:
         print(f"No input images found at: {input_image_path}", file=sys.stderr)
         sys.exit(2)
-
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{_now()}] Found {len(paths)} image(s) under {input_image_path}")
-    print(f"[{_now()}] Hardcoded NUM_FRAMES={NUM_FRAMES}; fixed-depth volume=({FIXED_DEPTH_MIN},{FIXED_DEPTH_MAX}); intrinsics_mode={INTRINSICS_MODE}")
-
+    print(f"[{_now()}] NUM_FRAMES={NUM_FRAMES}")
+    print(f"[{_now()}] Movements per image: left + right + zoom-out -> merged")
     def _fetch(key: str, local_path: Path, label: str) -> bool:
         if not key:
             return False
@@ -503,7 +438,6 @@ def main(
         except Exception as e:
             print(f"[{_now()}] WARNING: could not read {label} ({e})")
             return False
-
     active: List[Tuple[modal.FunctionCall, str, bytes]] = []
     for p in paths:
         base = p.stem
@@ -517,7 +451,6 @@ def main(
             use_offload=bool(offload),
         )
         active.append((call, base, img_bytes))
-
         if len(active) >= max_concurrent_images:
             call0, base0, _ = active.pop(0)
             try:
@@ -526,8 +459,9 @@ def main(
                 print(f"[{_now()}] ERROR: image '{base0}' failed: {e}", file=sys.stderr)
                 continue
             merged = manifest.get("merged_final") or ""
-            left_final = manifest.get("left_final") or ""
-            right_final = manifest.get("right_final") or ""
+            rotl = manifest.get("rotate_left_final") or ""
+            rotr = manifest.get("rotate_right_final") or ""
+            zoomo = manifest.get("zoom_out_final") or ""
             if merged:
                 _fetch(merged, out_dir / merged, "merged video")
                 if (out_dir / merged).name != f"{base0}.mp4":
@@ -536,20 +470,12 @@ def main(
                         print(f"[{_now()}] Saved convenience copy: {out_dir / f'{base0}.mp4'}")
                     except Exception:
                         pass
-            if left_final:
-                _fetch(left_final, out_dir / left_final, "left final")
-            if right_final:
-                _fetch(right_final, out_dir / right_final, "right final")
-            for key_name, label in [
-                ("left_conditioning", "left conditioning"),
-                ("right_conditioning", "right conditioning"),
-                ("left_buffers", "left buffers"),
-                ("right_buffers", "right buffers"),
-            ]:
-                k = manifest.get(key_name) or ""
-                if k:
-                    _fetch(k, out_dir / k, label)
-
+            if rotl:
+                _fetch(rotl, out_dir / rotl, "rotate-left final")
+            if rotr:
+                _fetch(rotr, out_dir / rotr, "rotate-right final")
+            if zoomo:
+                _fetch(zoomo, out_dir / zoomo, "zoom-out final")
     while active:
         call, base, _ = active.pop(0)
         try:
@@ -558,8 +484,9 @@ def main(
             print(f"[{_now()}] ERROR: image '{base}' failed: {e}", file=sys.stderr)
             continue
         merged = manifest.get("merged_final") or ""
-        left_final = manifest.get("left_final") or ""
-        right_final = manifest.get("right_final") or ""
+        rotl = manifest.get("rotate_left_final") or ""
+        rotr = manifest.get("rotate_right_final") or ""
+        zoomo = manifest.get("zoom_out_final") or ""
         if merged:
             _fetch(merged, out_dir / merged, "merged video")
             if (out_dir / merged).name != f"{base}.mp4":
@@ -568,18 +495,11 @@ def main(
                     print(f"[{_now()}] Saved convenience copy: {out_dir / f'{base}.mp4'}")
                 except Exception:
                     pass
-        if left_final:
-            _fetch(left_final, out_dir / left_final, "left final")
-        if right_final:
-            _fetch(right_final, out_dir / right_final, "right final")
-        for key_name, label in [
-            ("left_conditioning", "left conditioning"),
-            ("right_conditioning", "right conditioning"),
-            ("left_buffers", "left buffers"),
-            ("right_buffers", "right buffers"),
-        ]:
-            k = manifest.get(key_name) or ""
-            if k:
-                _fetch(k, out_dir / k, label)
-
+        if rotl:
+            _fetch(rotl, out_dir / rotl, "rotate-left final")
+        if rotr:
+            _fetch(rotr, out_dir / rotr, "rotate-right final")
+        if zoomo:
+            _fetch(zoomo, out_dir / zoomo, "zoom-out final")
     print(f"[{_now()}] Done.")
+

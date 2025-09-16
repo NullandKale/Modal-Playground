@@ -4,3 +4,6 @@ output_quilts/*
 .venv/*
 venv/*
 __pycache__/*
+input_quilts/*
+input_rgbd/*
+.codex/codex.yaml
